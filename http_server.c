@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BACKLOG 16
@@ -20,7 +21,7 @@
 #define RESP_BUF 1024
 #define QUEUE_CAPACITY 64
 #define DEFAULT_WORKERS 4
-#define MAX_WORKERS 32
+#define MAX_WORKERS 8
 
 struct mime_map {
     const char *ext;
@@ -44,8 +45,13 @@ static const struct mime_map mime_types[] = {
     {NULL, NULL}
 };
 
+struct client_job {
+    int fd;
+    struct sockaddr_in addr;
+};
+
 struct work_queue {
-    int fds[QUEUE_CAPACITY];
+    struct client_job jobs[QUEUE_CAPACITY];
     int head;
     int tail;
     int count;
@@ -59,6 +65,8 @@ struct worker_args {
     const char *root;
 };
 
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void queue_init(struct work_queue *q) {
     q->head = 0;
     q->tail = 0;
@@ -68,27 +76,56 @@ static void queue_init(struct work_queue *q) {
     pthread_cond_init(&q->not_full, NULL);
 }
 
-static void queue_push(struct work_queue *q, int fd) {
+static void queue_push(struct work_queue *q, int fd, const struct sockaddr_in *addr) {
     pthread_mutex_lock(&q->mutex);
     while (q->count == QUEUE_CAPACITY)
         pthread_cond_wait(&q->not_full, &q->mutex);
-    q->fds[q->tail] = fd;
+    q->jobs[q->tail].fd = fd;
+    if (addr)
+        q->jobs[q->tail].addr = *addr;
     q->tail = (q->tail + 1) % QUEUE_CAPACITY;
     q->count++;
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->mutex);
 }
 
-static int queue_pop(struct work_queue *q) {
+static struct client_job queue_pop(struct work_queue *q) {
+    struct client_job job = {.fd = -1};
     pthread_mutex_lock(&q->mutex);
     while (q->count == 0)
         pthread_cond_wait(&q->not_empty, &q->mutex);
-    int fd = q->fds[q->head];
+    job = q->jobs[q->head];
     q->head = (q->head + 1) % QUEUE_CAPACITY;
     q->count--;
     pthread_cond_signal(&q->not_full);
     pthread_mutex_unlock(&q->mutex);
-    return fd;
+    return job;
+}
+
+static void log_access(const struct sockaddr_in *addr, const char *method, const char *path, int status, size_t bytes) {
+    char ip[INET_ADDRSTRLEN] = "-";
+    char timestamp[32];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm_info;
+    gmtime_r(&ts.tv_sec, &tm_info);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &tm_info);
+    snprintf(timestamp + 19, sizeof(timestamp) - 19, ".%03ldZ", ts.tv_nsec / 1000000L);
+
+    if (addr) {
+        if (!inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip)))
+            strncpy(ip, "?", sizeof(ip));
+        ip[sizeof(ip) - 1] = '\0';
+    }
+    if (!method || !*method)
+        method = "-";
+    if (!path || !*path)
+        path = "-";
+
+    pthread_mutex_lock(&log_mutex);
+    fprintf(stdout, "%s %s \"%s %s\" %d %zu\n", timestamp, ip, method, path, status, bytes);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
 }
 
 static void trim_crlf(char *s) {
@@ -179,104 +216,138 @@ static int is_safe_path(const char *path) {
     return 1;
 }
 
-static void handle_client(int client, const char *root) {
+static void handle_client(int client, const char *root, const struct sockaddr_in *addr) {
     char request[REQ_BUF];
+    char method[8] = {0};
+    char url[1024] = {0};
+    char version[16] = {0};
+    char path_decoded[1024] = {0};
+    char full_path[PATH_MAX];
+    const char *resource = "-";
+    int status = 500;
+    size_t bytes = 0;
+
     if (read_request(client, request, sizeof(request)) < 0) {
+        status = 400;
         send_error(client, 400, "Bad Request", "Failed to read request.");
-        return;
+        goto done;
     }
 
-    char method[8], url[1024], version[16];
     if (sscanf(request, "%7s %1023s %15s", method, url, version) != 3) {
+        status = 400;
         send_error(client, 400, "Bad Request", "Malformed request line.");
-        return;
+        goto done;
     }
     trim_crlf(version);
+    resource = url;
 
     if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+        status = 405;
         send_error(client, 405, "Method Not Allowed", "Only GET and HEAD are supported.");
-        return;
+        goto done;
     }
 
-    char path_decoded[1024];
     url_decode(path_decoded, url);
+    resource = path_decoded;
 
     if (path_decoded[0] != '/' || !is_safe_path(path_decoded)) {
+        status = 403;
         send_error(client, 403, "Forbidden", "Invalid path.");
-        return;
+        goto done;
     }
 
-    char full_path[PATH_MAX];
     size_t needed = strlen(root) + strlen(path_decoded) + 1;
     if (needed > sizeof(full_path)) {
+        status = 414;
         send_error(client, 414, "URI Too Long", "Request path is too long.");
-        return;
+        goto done;
     }
     snprintf(full_path, sizeof(full_path), "%s%s", root, path_decoded);
 
-    if (full_path[strlen(full_path) - 1] == '/') {
+    size_t full_len = strlen(full_path);
+    if (full_len && full_path[full_len - 1] == '/') {
         if (strlen(full_path) + strlen("index.html") >= sizeof(full_path)) {
+            status = 500;
             send_error(client, 500, "Internal Server Error", "Path too long.");
-            return;
+            goto done;
         }
         strcat(full_path, "index.html");
     }
 
     struct stat st;
     if (stat(full_path, &st) < 0) {
-        if (errno == ENOENT)
+        if (errno == ENOENT) {
+            status = 404;
             send_error(client, 404, "Not Found", "File not found.");
-        else if (errno == EACCES)
+        } else if (errno == EACCES) {
+            status = 403;
             send_error(client, 403, "Forbidden", "Access denied.");
-        else
+        } else {
+            status = 500;
             send_error(client, 500, "Internal Server Error", "Stat failed.");
-        return;
+        }
+        goto done;
     }
 
     if (!S_ISREG(st.st_mode)) {
+        status = 403;
         send_error(client, 403, "Forbidden", "Not a regular file.");
-        return;
+        goto done;
     }
 
     int fd = open(full_path, O_RDONLY);
     if (fd < 0) {
-        if (errno == EACCES)
+        if (errno == EACCES) {
+            status = 403;
             send_error(client, 403, "Forbidden", "Access denied.");
-        else
+        } else {
+            status = 500;
             send_error(client, 500, "Internal Server Error", "Failed to open file.");
-        return;
+        }
+        goto done;
     }
 
     const char *mime = get_mime_type(full_path);
     if (send_headers(client, 200, "OK", mime, (size_t)st.st_size) < 0) {
         close(fd);
-        return;
+        status = 500;
+        goto done;
     }
 
     if (strcmp(method, "HEAD") == 0) {
         close(fd);
-        return;
+        status = 200;
+        goto done;
     }
 
     char buf[REQ_BUF];
     ssize_t n;
+    bytes = (size_t)st.st_size;
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
         if (send_all(client, buf, (size_t)n) < 0)
             break;
     }
     close(fd);
-    if (n < 0)
+    if (n < 0) {
+        status = 500;
+        bytes = 0;
         send_error(client, 500, "Internal Server Error", "Failed while reading file.");
+        goto done;
+    }
+    status = 200;
+
+done:
+    log_access(addr, method, resource, status, bytes);
 }
 
 static void *worker_main(void *arg) {
     struct worker_args *ctx = (struct worker_args *)arg;
     for (;;) {
-        int client = queue_pop(ctx->queue);
-        if (client < 0)
+        struct client_job job = queue_pop(ctx->queue);
+        if (job.fd < 0)
             continue;
-        handle_client(client, ctx->root);
-        close(client);
+        handle_client(job.fd, ctx->root, &job.addr);
+        close(job.fd);
     }
     return NULL;
 }
@@ -357,7 +428,7 @@ int main(int argc, char **argv) {
             perror("accept");
             continue;
         }
-        queue_push(&queue, client);
+        queue_push(&queue, client, &client_addr);
     }
 
     close(server);
