@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,9 @@
 #define BACKLOG 16
 #define REQ_BUF 4096
 #define RESP_BUF 1024
+#define QUEUE_CAPACITY 64
+#define DEFAULT_WORKERS 4
+#define MAX_WORKERS 32
 
 struct mime_map {
     const char *ext;
@@ -39,6 +43,53 @@ static const struct mime_map mime_types[] = {
     {".pdf", "application/pdf"},
     {NULL, NULL}
 };
+
+struct work_queue {
+    int fds[QUEUE_CAPACITY];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+};
+
+struct worker_args {
+    struct work_queue *queue;
+    const char *root;
+};
+
+static void queue_init(struct work_queue *q) {
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+}
+
+static void queue_push(struct work_queue *q, int fd) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->count == QUEUE_CAPACITY)
+        pthread_cond_wait(&q->not_full, &q->mutex);
+    q->fds[q->tail] = fd;
+    q->tail = (q->tail + 1) % QUEUE_CAPACITY;
+    q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+static int queue_pop(struct work_queue *q) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->count == 0)
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+    int fd = q->fds[q->head];
+    q->head = (q->head + 1) % QUEUE_CAPACITY;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+    return fd;
+}
 
 static void trim_crlf(char *s) {
     size_t len = strlen(s);
@@ -218,6 +269,18 @@ static void handle_client(int client, const char *root) {
         send_error(client, 500, "Internal Server Error", "Failed while reading file.");
 }
 
+static void *worker_main(void *arg) {
+    struct worker_args *ctx = (struct worker_args *)arg;
+    for (;;) {
+        int client = queue_pop(ctx->queue);
+        if (client < 0)
+            continue;
+        handle_client(client, ctx->root);
+        close(client);
+    }
+    return NULL;
+}
+
 static int create_server_socket(int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0)
@@ -245,10 +308,16 @@ static int create_server_socket(int port) {
 int main(int argc, char **argv) {
     const char *root_arg = argc > 1 ? argv[1] : ".";
     int port = argc > 2 ? atoi(argv[2]) : 8080;
+    int worker_count = argc > 3 ? atoi(argv[3]) : DEFAULT_WORKERS;
     if (port <= 0 || port > 65535) {
         fprintf(stderr, "Invalid port: %d\n", port);
         return EXIT_FAILURE;
     }
+
+    if (worker_count <= 0)
+        worker_count = DEFAULT_WORKERS;
+    if (worker_count > MAX_WORKERS)
+        worker_count = MAX_WORKERS;
 
     char root[PATH_MAX];
     if (!realpath(root_arg, root)) {
@@ -264,7 +333,21 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    printf("Serving %s on port %d\n", root, port);
+    struct work_queue queue;
+    queue_init(&queue);
+
+    pthread_t threads[MAX_WORKERS];
+    struct worker_args worker_ctx[MAX_WORKERS];
+    for (int i = 0; i < worker_count; ++i) {
+        worker_ctx[i].queue = &queue;
+        worker_ctx[i].root = root;
+        if (pthread_create(&threads[i], NULL, worker_main, &worker_ctx[i]) != 0) {
+            perror("pthread_create");
+            return EXIT_FAILURE;
+        }
+    }
+
+    printf("Serving %s on port %d with %d workers\n", root, port, worker_count);
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -274,8 +357,7 @@ int main(int argc, char **argv) {
             perror("accept");
             continue;
         }
-        handle_client(client, root);
-        close(client);
+        queue_push(&queue, client);
     }
 
     close(server);
